@@ -1,0 +1,192 @@
+
+
+парсер авито вакансий парсит зп название ссылку 
+
+import time, random, csv,re
+import undetected_chromedriver as uc
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+# --- НАСТРОЙКИ ---
+BASE_URL = "https://www.avito.ru/krasnodar/vakansii/tag/operator-azs"
+OUTPUT_CSV = "avito_vacancies_selenium.csv"
+MAX_PAGES = 1
+HEADLESS = False
+CHROME_VERSION = 155  # Проверь, что совпадает с версией твоего Chrome
+
+
+# -----------------
+
+def get_driver():
+    options = uc.ChromeOptions()
+    if HEADLESS:
+        options.add_argument("--headless=new")
+
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    driver = uc.Chrome(options=options, version_main=CHROME_VERSION)
+
+    # Маскировка через CDP
+    driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+        "source": """
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            Object.defineProperty(navigator, 'languages', {get: () => ['ru-RU', 'ru']});
+        """
+    })
+    return driver
+
+
+def scroll_down_heavy(driver, scroll_count=8, pause_base=2.5):
+    last_height = driver.execute_script("return document.body.scrollHeight")
+    for i in range(scroll_count):
+        print(f"   Прокрутка #{i + 1}...")
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        pause = pause_base + random.uniform(0.5, 1.5)
+        time.sleep(pause)
+        new_height = driver.execute_script("return document.body.scrollHeight")
+        if new_height == last_height:
+            print("   Дальше прокручивать некуда (конец страницы).")
+            break
+        last_height = new_height
+    time.sleep(random.uniform(3.0, 5.0))
+    print("   Финальная пауза для полной загрузки элементов.")
+
+
+
+
+
+def extract_salary_from_text(text):
+    """
+    Пытается вытащить зарплату из текста карточки.
+    Ловит форматы: «от 50 000 ₽», «50000 руб», «от 50 тыс», «45 тысяч».
+    """
+    if not text:
+        return None
+
+    # Нормализуем: заменяем «тыс», «тысяч» на «000», убираем лишние пробелы
+    normalized = text.lower().replace('\n', ' ').replace('\r', ' ')
+
+    # Заменяем «тыс»/«тысяч» на 000 для упрощения поиска
+    normalized = re.sub(r'(\d+)\s*(тыс|тысяч)', r'\1000', normalized)
+
+    # Ищем число, за которым сразу или через пробел идут ₽, руб, рублей
+    patterns = [
+        r'(от\s*)?([\d\s]+)(?:\s*[₽₽]|\s*руб\.?|\s*рублей)',
+        r'([\d]{4,})',  # Если нашли просто большое число (4+ цифры) — считаем зарплатой
+    ]
+
+    for pat in patterns:
+        m = re.search(pat, normalized)
+        if m:
+            num_part = m.group(2) or m.group(1) or ""
+            num = re.sub(r'\D', '', num_part)
+            if num and int(num) > 1000:  # отсекаем случайные числа вроде «2 года опыта»
+                return f"{int(num)} ₽"
+    return None
+
+
+def parse_vacancies(driver):
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
+
+    wait = WebDriverWait(driver, 15)
+    try:
+        cards = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div[data-marker='item']")))
+    except Exception:
+        print("⚠️ Карточки не найдены.")
+        return []
+
+    vacancies = []
+    total_cards = len(cards)
+    print(f"   Рассмотрено карточек: {total_cards}")
+
+    for idx, card in enumerate(cards):
+        try:
+            title_el = card.find_element(By.CSS_SELECTOR, "a[data-marker='item-title']")
+            title = title_el.text.strip()
+            link = title_el.get_attribute("href") or ""
+            if not link.startswith("http"):
+                link = "https://avito.ru" + link
+
+            # 1) Стандартный маркер цены (работает для многих карточек)
+            price_els = card.find_elements(By.CSS_SELECTOR, "span[data-marker='item-price']")
+            price = price_els[0].text.strip() if price_els else None
+
+            # 2) Селекторы, которые реально встречаются в вакансиях Авито
+            if not price:
+                # Часто цена лежит в блоке с классом, содержащим 'price' или 'cost'
+                alt_els = card.find_elements(By.CSS_SELECTOR,
+                                             "div[class*='price'], span[class*='price'], .snippet-price, .item-price-text")
+                if alt_els:
+                    price = alt_els[0].text.strip()
+
+            # 3) Если не нашли в блоках — ищем по тексту всей карточки
+            if not price:
+                card_text = card.text
+                # Для отладки: выводим первые 150 символов текста карточки — сразу видно, что там есть
+                if idx < 3:
+                    print(f"   [Отладка] Карточка #{idx + 1} текст (фрагмент): {card_text[:150]}")
+                extracted = extract_salary_from_text(card_text)
+                if extracted:
+                    price = extracted
+
+            if not price:
+                price = "не указана"
+
+            location_els = card.find_elements(By.CSS_SELECTOR, "div[data-marker='item-address']")
+            location = location_els[0].text.strip() if location_els else ""
+
+            vacancies.append({
+                "title": title,
+                "location": location,
+                "salary": price,
+                "link": link,
+            })
+        except Exception as e:
+            # Для портфолио это плюс: «устойчивая обработка битых карточек»
+            continue
+
+    return vacancies
+
+def save_to_csv(data, filename):
+    fieldnames = ["title", "location", "salary", "link"]
+    with open(filename, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(data)
+    print(f"✅ Сохранено {len(data)} записей в '{filename}'.")
+
+
+def main():
+    driver = None
+    try:
+        driver = get_driver()
+        all_vacancies = []
+
+        for page in range(1, MAX_PAGES + 1):
+            url = f"{BASE_URL}"  # Для демо одной страницы
+            print(f"📄 Открываем: {url}")
+            driver.get(url)
+            scroll_down_heavy(driver, scroll_count=8, pause_base=2.5)
+            vacancies = parse_vacancies(driver)
+            all_vacancies.extend(vacancies)
+            print(f"   Найдено на странице: {len(vacancies)}")
+            time.sleep(random.uniform(2.0, 4.0))
+
+        save_to_csv(all_vacancies, OUTPUT_CSV)
+
+    except Exception as e:
+        print(f"⚠️ Критическая ошибка: {e}")
+    finally:
+        if driver is not None:
+            try:
+                driver.quit()
+            except Exception:
+                # Игнорируем ошибку закрытия на Windows (WinError 6)
+                pass
+
+
+if __name__ == "__main__":
+    main()
